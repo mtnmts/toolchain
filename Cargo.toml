@@ -1,6 +1,7 @@
 [workspace]
 members = [
-	"lib",
+	"lib/lsp-client",
 	"toolchain",
 	"tools/example",
+	"tools/explode",
 	]
