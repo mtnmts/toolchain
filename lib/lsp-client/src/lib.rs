@@ -1,10 +1,14 @@
+#[macro_use]
+extern crate log;
 use {
-    lsp_types::{ClientCapabilities, InitializeParams},
+    lsp_types::{ClientCapabilities, InitializeParams, InitializeResult},
     std::error::Error,
     std::fmt,
     std::io,
+    std::io::{BufRead, BufReader, Read, Write},
+    std::ops::Add,
     std::path::PathBuf,
-    std::process::{Child, Command, Stdio},
+    std::process::{Child, ChildStdin, ChildStdout, Command, Stdio},
 };
 
 type LSPResult = Result<(), LSPError>;
@@ -28,7 +32,7 @@ impl Language {
 
 struct LSPServer {
     language: Language,
-    workspace: PathBuf,
+    workspace: String,
     started: bool,
     process: Option<Child>,
 }
@@ -54,8 +58,10 @@ unsafe impl Sync for LSPStopError {}
 enum LSPError {
     StartError(LSPStartError),
     StopError(LSPStopError),
+    JSONSerializationError(serde_json::Error),
     NotRunning,
     InvalidProcess,
+    Other(&'static str),
 }
 
 unsafe impl Send for LSPError {}
@@ -81,10 +87,12 @@ impl fmt::Display for LSPStartError {
 impl fmt::Display for LSPError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::StartError(_) => write!(f, "LSP start error"),
-            Self::StopError(_) => write!(f, "LSP stop error"),
+            Self::StartError(..) => write!(f, "LSP start error"),
+            Self::StopError(..) => write!(f, "LSP stop error"),
             Self::NotRunning => write!(f, "LSP is not running"),
             Self::InvalidProcess => write!(f, "Process is not initialized"),
+            Self::JSONSerializationError(..) => write!(f, "Failed to serialize type to JSON"),
+            Self::Other(s) => write!(f, "Error in LSPServer: {}", &s),
         }
     }
 }
@@ -112,6 +120,7 @@ impl Error for LSPError {
         match self {
             Self::StartError(e) => Some(e),
             Self::StopError(e) => Some(e),
+            Self::JSONSerializationError(e) => Some(e),
             _ => None,
         }
     }
@@ -133,21 +142,21 @@ struct LSPProtocol {}
 type InitializeRequest = InitializeParams;
 impl LSPProtocol {
     fn initialize_request(root_dir: &str) -> InitializeRequest {
-        InitializeParams { 
-            process_id : None, 
-            root_path : Some(root_dir.to_owned()), 
+        InitializeParams {
+            process_id: None,
+            root_path: Some(root_dir.to_owned()),
             root_uri: None,
-            initialization_options : None, 
-            capabilities : ClientCapabilities::default(),
+            initialization_options: None,
+            capabilities: ClientCapabilities::default(),
             trace: None,
             /// TODO: need workspace folders? support multiple projects with single LSP?
             workspace_folders: None,
         }
-    } 
+    }
 }
 
 impl LSPServer {
-    fn new(language: Language, workspace: PathBuf) -> Self {
+    fn new(language: Language, workspace: String) -> Self {
         Self {
             language,
             workspace,
@@ -159,17 +168,44 @@ impl LSPServer {
     fn process(&self) -> Result<&Child, LSPError> {
         self.process.as_ref().ok_or(LSPError::InvalidProcess)
     }
-   
+
     fn process_mut(&mut self) -> Result<&mut Child, LSPError> {
         self.process.as_mut().ok_or(LSPError::InvalidProcess)
     }
-    async fn _initialize_lsp(&self) -> LSPResult {
+    fn initialize_lsp(&mut self) -> LSPResult {
         self.started()?;
-        let _proc = self.process()?;
-        let stdin = _proc.stdin.as_ref().unwrap();
+        let request = LSPProtocol::initialize_request(&self.workspace);
+        let mut req_ser =
+            serde_json::to_string(&request).map_err(|e| LSPError::JSONSerializationError(e))?;
+        req_ser = format!("Content-Length: {}\r\n{}", req_ser.len(), req_ser);
+        let proc = self.process_mut()?;
+        let stdin = proc
+            .stdin
+            .as_mut()
+            .ok_or_else(|| LSPError::Other("stdin is unavailable"))?;
+
+        let stdout: &mut ChildStdout = proc
+            .stdout
+            .as_mut()
+            .ok_or_else(|| LSPError::Other("stdout is unavailable"))?;
+
+        stdin
+            .write_all(req_ser.as_bytes())
+            .map_err(|_| LSPError::Other("Failed to write to LSP"))?;
+        stdin.flush();
+        let mut output = String::new();
+        /// TODO: Find a way to read async. I want to manage messages from the LSP server in a
+        /// non-blocking manner, this can be hacked manually through the RawFd but that would be
+        /// a bad way
+        let mut reader = BufReader::new(stdout);
+        reader.read_line(&mut output).unwrap();
+        /* let res: InitializeResult = serde_json::from_reader(stdout)
+        .map_err(|_| LSPError::Other("Failed to decode JSON from LSP Server"))?; */
+        error!("Initialize LSP Response: {:?}", output);
         Ok(())
     }
-    fn started(&self) -> Result<(), LSPError> {
+
+    fn started(&self) -> LSPResult {
         match self.started {
             true => Ok(()),
             false => Err(LSPError::NotRunning),
@@ -212,10 +248,16 @@ impl LSPServer {
     }
 }
 
+#[cfg(test)]
 mod test {
     use super::*;
+    fn setup() {
+        let _ = env_logger::builder().is_test(true).try_init();
+    }
+
     #[test]
     fn test_sanity_lsp_server_start_stop() {
+        setup();
         let mut lsp_server = LSPServer::new(Language::Rust, ".".into());
         lsp_server.start().unwrap();
         lsp_server.stop().unwrap();
@@ -223,8 +265,17 @@ mod test {
 
     #[test]
     fn test_sanity_lsp_server_start_restart() {
+        setup();
         let mut lsp_server = LSPServer::new(Language::Rust, ".".into());
         lsp_server.start().unwrap();
         lsp_server.restart().unwrap();
+    }
+
+    #[test]
+    fn test_lsp_initialize() {
+        setup();
+        let mut lsp_server = LSPServer::new(Language::Rust, ".".into());
+        lsp_server.start().unwrap();
+        lsp_server.initialize_lsp().unwrap();
     }
 }

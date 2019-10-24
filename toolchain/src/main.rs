@@ -22,7 +22,7 @@ fn program_to_fn(prog: Program) -> impl FnOnce(Vec<String>) {
     }
 }
 
-fn help(args: Vec<String>) {
+fn help(_args: Vec<String>) {
     println!("Help called");
 }
 
@@ -30,7 +30,7 @@ fn main() {
     let mut args: Vec<String> = env::args().collect();
     let mut first_arg = args
         .first()
-        .map(|(a)| a.to_owned())
+        .map(|a| a.to_owned())
         .unwrap_or_else(|| ("tc".to_owned()));
     if first_arg == "tc" {
         args.drain(0..1);
